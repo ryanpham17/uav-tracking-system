@@ -2,16 +2,18 @@ import numpy as np
 import cv2 as cv
 from ultralytics import YOLO as yolo
 
-model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
-
+#model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
+model = yolo("models/yolo26n.pt") #use to test with cars
 
 #create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
-cap = cv.VideoCapture("videos/test4.mp4") 
+cap = cv.VideoCapture("videos/testroad.mp4") 
 
 #make sure the video file is opened successfully
 if not cap.isOpened():
     print("Error: Could not open video.")
     exit()
+
+track_history = {} #dictionary to store the track history of each object
 
 #run while loop to read frames from the video
 while cap.isOpened():
@@ -30,7 +32,35 @@ while cap.isOpened():
         verbose = False,
         device = 0,
         quantize = 16)[0] #run the model on the frame and get the results (detections)
+
+    if result.boxes.id is not None:
+        track_ids = result.boxes.id.int().cpu().tolist() #get the track IDs of the detected objects
+        boxes = result.boxes.xywh.cpu().tolist() #get the bounding boxes of the detected objects
+
+        for box, track_id in zip(boxes, track_ids):
+            x, y, width, height = box #unpack the bounding box coordinates (x, y, width, height)
+
+            if track_id not in track_history:
+                track_history[track_id] = [] #initialize the track history for this object
+
+            track_history[track_id].append((int(x), int(y)))
+
+            if len(track_history[track_id]) > 50:
+                track_history[track_id].pop(0)
+
     annotated_frame = result.plot()
+
+    for track_id, points in track_history.items(): #.items() lets you access key, value
+        if len(points) > 1: #only draw the trajectory if there are at least 2 points
+            points_array= np.array(points, dtype = np.int32) #convert the list of points to a numpy array
+            cv.polylines( #draw the trajectory of the object on the frame
+                annotated_frame,
+                [points_array],
+                isClosed = False,
+                color = (255, 0, 0), #OpenCV uses BGR not RBG
+                thickness = 5
+            )
+
     display_frame = cv.resize(annotated_frame, (1280, 720))
     cv.imshow("UAV Tracker", display_frame) #display the frame in a window
 
