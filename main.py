@@ -74,7 +74,7 @@ while cap.isOpened():
                 }
 
                 #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
-
+                
             if len(track_history[track_id]) > 50:
                 track_history[track_id].pop(0)
 
