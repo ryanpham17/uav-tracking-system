@@ -2,11 +2,11 @@ import numpy as np
 import cv2 as cv
 from ultralytics import YOLO as yolo
 
-#model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
-model = yolo("models/yolo26n.pt") #use to test with cars
+model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
+#model = yolo("models/yolo26n.pt") #use to test with cars
 
 #create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
-cap = cv.VideoCapture("videos/testroad.mp4") 
+cap = cv.VideoCapture("videos/test2.mp4") 
 
 if not cap.isOpened():
     print("Error: Could not open video.")
@@ -14,9 +14,10 @@ if not cap.isOpened():
 
 fps = cap.get(cv.CAP_PROP_FPS) #get the frames per second of the video
 
-track_history = {} #store the track history of each object
+track_history = {} #store the track history of each object (key = track_id, value = list of (x, y) coordinates)
 telemetry = {} #store the telemetry data of each object
 last_seen = {} #store the last seen frame of each object (key = track_id, value = last seen frame)
+last_position = {} #store the last position of each object (key = track_id, value = (x, y) coordinates)
 
 current_frame = 0
 max_missing_frames = 30 #max frames an object can be missing before it is considered lost
@@ -44,45 +45,53 @@ while cap.isOpened():
     #work through every tracked object in the curr frame
     if result.boxes.id is not None:
         track_ids = result.boxes.id.int().cpu().tolist() #get the track IDs/bounding boxes of the detected objects
-        boxes = result.boxes.xywh.cpu().tolist()
+        boxes = result.boxes.xywh.cpu().tolist() #use xywh to get the center
 
         #update the track history and telemetry data for each detected object
         for box, track_id in zip(boxes, track_ids):
             x, y, width, height = box #unpack the bounding box coordinates (x, y, width, height)
+            current_x = int(x)
+            current_y = int(y)
             last_seen[track_id] = current_frame #update the last seen frame for each object in the curr frame
 
             if track_id not in track_history:
                 track_history[track_id] = [] #initialize the track history for this object
                 telemetry[track_id] = {} #initialize the telemetry data for this object
 
-            track_history[track_id].append((int(x), int(y)))
+            track_history[track_id].append((current_x, current_y))
 
             #calculate the distance moved by the object since the last frame
-            if len(track_history[track_id]) >= 2: 
-                previous_x, previous_y = track_history[track_id][-2]
-                current_x, current_y = track_history[track_id][-1]
+            if track_id in last_position: 
+                previous_x, previous_y, previous_frame = last_position[track_id]
 
                 dx = current_x - previous_x
                 dy = current_y - previous_y
 
                 distance = np.sqrt(dx**2 + dy**2)
 
-                #eventually change for when detections are missing. need to use actual frame/time difference
-                speed_px_per_sec = distance * fps #calculate speed in pixels per second
+                frame_difference = current_frame - previous_frame #used so program knows object was unseen for more than 1 frame
 
-                #store the telemetry data for this object (updates every frame)
-                telemetry[track_id] = {
-                    "x": current_x,
-                    "y": current_y,
-                    "dx": dx,
-                    "dy": dy,
-                    "distance_px": distance,
-                    "speed_px_per_sec": speed_px_per_sec
-                }
+                if frame_difference > 0:
+                    time_difference = frame_difference / fps
+                    speed_px_per_sec = distance / time_difference 
 
-                #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
+                    #store the telemetry data for this object (updates every frame)
+                    telemetry[track_id] = {
+                        "x": current_x,
+                        "y": current_y,
+                        "dx": dx,
+                        "dy": dy,
+                        "distance_px": distance,
+                        "frame_difference": frame_difference,
+                        "time_difference_sec": time_difference,
+                        "speed_px_per_sec": speed_px_per_sec
+                    }
+
+                    #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
+            
+            last_position[track_id] = (current_x, current_y, current_frame) #update the last position of this object
                 
-            if len(track_history[track_id]) > 50:
+            if len(track_history[track_id]) > 30:
                 track_history[track_id].pop(0)
 
     #check for stale tracks to remove tracking
@@ -94,9 +103,11 @@ while cap.isOpened():
 
     #pop the stale tracks from the dictionaries
     for track_id in stale_tracks:
+        #print(f"Removing stale track: {track_id}")
         track_history.pop(track_id, None)
         telemetry.pop(track_id, None)
         last_seen.pop(track_id, None)
+        last_position.pop(track_id, None)
 
     annotated_frame = result.plot()
 
