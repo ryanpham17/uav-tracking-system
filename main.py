@@ -2,11 +2,11 @@ import numpy as np
 import cv2 as cv
 from ultralytics import YOLO as yolo
 
-model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
-#model = yolo("models/yolo26n.pt") #use to test with cars
+#model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
+model = yolo("models/yolo26n.pt") #use to test with cars
 
 #create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
-cap = cv.VideoCapture("videos/test2.mp4") 
+cap = cv.VideoCapture("videos/testroad.mp4") 
 
 if not cap.isOpened():
     print("Error: Could not open video.")
@@ -18,6 +18,7 @@ track_history = {} #store the track history of each object (key = track_id, valu
 telemetry = {} #store the telemetry data of each object
 last_seen = {} #store the last seen frame of each object (key = track_id, value = last seen frame)
 last_position = {} #store the last position of each object (key = track_id, value = (x, y) coordinates)
+speed_history = {} #store the speed history of each object (key = track_id, value = recent speed measurements)
 
 current_frame = 0
 max_missing_frames = 30 #max frames an object can be missing before it is considered lost
@@ -57,6 +58,7 @@ while cap.isOpened():
             if track_id not in track_history:
                 track_history[track_id] = [] #initialize the track history for this object
                 telemetry[track_id] = {} #initialize the telemetry data for this object
+                speed_history[track_id] = [] #initialize the speed history for this object
 
             track_history[track_id].append((current_x, current_y))
 
@@ -73,7 +75,13 @@ while cap.isOpened():
 
                 if frame_difference > 0:
                     time_difference = frame_difference / fps
-                    speed_px_per_sec = distance / time_difference 
+                    speed_px_per_sec = distance / time_difference
+                    speed_history[track_id].append(speed_px_per_sec)
+
+                    if len(speed_history[track_id]) > 5:
+                        speed_history[track_id].pop(0) #keep only the last 5 speed measurements
+
+                    smoothed_speed = np.mean(speed_history[track_id]) #calculate the average speed over the last 5 measurements
 
                     #store the telemetry data for this object (updates every frame)
                     telemetry[track_id] = {
@@ -84,7 +92,8 @@ while cap.isOpened():
                         "distance_px": distance,
                         "frame_difference": frame_difference,
                         "time_difference_sec": time_difference,
-                        "speed_px_per_sec": speed_px_per_sec
+                        "speed_px_per_sec": speed_px_per_sec,
+                        "smoothed_speed_px_per_sec": smoothed_speed
                     }
 
                     #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
@@ -108,7 +117,8 @@ while cap.isOpened():
         telemetry.pop(track_id, None)
         last_seen.pop(track_id, None)
         last_position.pop(track_id, None)
-
+        speed_history.pop(track_id, None)
+        
     annotated_frame = result.plot()
 
     for track_id, points in track_history.items(): #.items() lets you access key, value
