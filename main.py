@@ -2,6 +2,36 @@ import numpy as np
 import cv2 as cv
 from ultralytics import YOLO as yolo
 
+def create_kalman_filter(x, y, dt):
+    kf = cv.KalmanFilter(4, 2)
+
+    #define the state transition matrix (A) and measurement matrix (H)
+    kf.transitionMatrix = np.array([
+        [1, 0, dt, 0], #[x, y, vx, vy]
+        [0, 1, 0, dt],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ], dtype=np.float32)
+
+    #define the measurement matrix (H)
+    kf.measurementMatrix = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0]
+    ], dtype=np.float32)
+
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03 #process noise covariance: How much do I distrust my assumption that the object moves at constant velocity?
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0 #measurement noise covariance: How much do I distrust my assumption that the object moves at constant velocity?
+
+    #initialize the state vector (x, y, dx, dy) with the initial position and zero velocity
+    kf.statePost = np.array([
+        [x],
+        [y],
+        [0],
+        [0]
+    ], dtype=np.float32)
+
+    return kf
+
 #model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
 model = yolo("models/yolo26n.pt") #use to test with cars
 
@@ -13,12 +43,14 @@ if not cap.isOpened():
     exit()
 
 fps = cap.get(cv.CAP_PROP_FPS) #get the frames per second of the video
+dt = 1 / fps #calculate the time difference between frames. delta time
 
 track_history = {} #store the track history of each object (key = track_id, value = list of (x, y) coordinates)
 telemetry = {} #store the telemetry data of each object
 last_seen = {} #store the last seen frame of each object (key = track_id, value = last seen frame)
 last_position = {} #store the last position of each object (key = track_id, value = (x, y) coordinates)
 speed_history = {} #store the speed history of each object (key = track_id, value = recent speed measurements)
+kalman_filters = {} #store the Kalman filter for each object (key = track_id, value = filter for that object)
 
 current_frame = 0
 max_missing_frames = 30 #max frames an object can be missing before it is considered lost
@@ -59,6 +91,26 @@ while cap.isOpened():
                 track_history[track_id] = [] #initialize the track history for this object
                 telemetry[track_id] = {} #initialize the telemetry data for this object
                 speed_history[track_id] = [] #initialize the speed history for this object
+                kalman_filters[track_id] = create_kalman_filter( #initialize the Kalman filter for this object
+                    current_x,
+                    current_y,
+                    dt
+                )
+
+            kf = kalman_filters[track_id] #get the Kalman filter for this object
+            prediction = kf.predict() #predict where the object is now
+
+            measurement = np.array([[np.float32(current_x)], [np.float32(current_y)]]) #create a measurement vector from the current position
+            corrected = kf.correct(measurement) #correct the prediction with the measurement
+
+            #store the filtered position (after Kalman filter correction) for this object
+            filtered_x = int(corrected[0][0])
+            filtered_y = int(corrected[1][0])
+
+            filtered_vx = float(corrected[2][0])
+            filtered_vy = float(corrected[3][0])
+
+            estimated_speed = np.sqrt(filtered_vx**2 + filtered_vy**2) #calculate the estimated speed from the filtered velocity components
 
             track_history[track_id].append((current_x, current_y))
 
@@ -87,13 +139,20 @@ while cap.isOpened():
                     telemetry[track_id] = {
                         "x": current_x,
                         "y": current_y,
+                        "filtered_x": filtered_x,
+                        "filtered_y": filtered_y,
+                        "filtered_vx_px_per_sec": filtered_vx,
+                        "filtered_vy_px_per_sec": filtered_vy,
+                        "estimated_speed_px_per_sec": estimated_speed,
                         "dx": dx,
                         "dy": dy,
                         "distance_px": distance,
                         "frame_difference": frame_difference,
                         "time_difference_sec": time_difference,
                         "speed_px_per_sec": speed_px_per_sec,
-                        "smoothed_speed_px_per_sec": smoothed_speed
+                        "smoothed_speed_px_per_sec": smoothed_speed,
+                        "filtered_x": filtered_x,
+                        "filtered_y": filtered_y,
                     }
 
                     #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
@@ -118,8 +177,36 @@ while cap.isOpened():
         last_seen.pop(track_id, None)
         last_position.pop(track_id, None)
         speed_history.pop(track_id, None)
-        
+        kalman_filters.pop(track_id, None)
+
     annotated_frame = result.plot()
+
+    #visualization area
+    for track_id, data in telemetry.items():
+        if "filtered_x" in data:
+            #show where the current velocity would carry the object after x seconds
+            velocity_scale = 0.5
+
+            #draw an arrow representing the velocity vector of the object
+            end_x = int(data["filtered_x"] + data["filtered_vx_px_per_sec"] * velocity_scale)
+            end_y = int(data["filtered_y"] + data["filtered_vy_px_per_sec"] * velocity_scale)
+
+            cv.arrowedLine(
+                annotated_frame,
+                (data["filtered_x"], data["filtered_y"]),
+                (end_x, end_y),
+                (0, 255, 0),
+                3
+            )
+
+            #draw a circle at the filtered position of the object
+            cv.circle(
+                annotated_frame,
+                (data["filtered_x"], data["filtered_y"]),
+                radius = 9,
+                color = (0, 0, 255), #OpenCV uses BGR not RBG
+                thickness = -1 #filled circle
+            )
 
     for track_id, points in track_history.items(): #.items() lets you access key, value
         if len(points) > 1: #only draw the trajectory if there are at least 2 points
