@@ -32,7 +32,14 @@ def create_kalman_filter(x, y, dt):
 
     return kf
 
-#model = yolo("models/drone-yolo26m.pt") #load a pretrained yolo model
+#predict the future position of an object given its current position, velocity, and time ahead
+def predict_future_position(x, y, vx, vy, time_ahead):
+    future_x = x + vx * time_ahead
+    future_y = y + vy * time_ahead
+
+    return int(future_x), int(future_y)
+
+#model = yolo("models/drone-yolo26m.pt") #drone model
 model = yolo("models/yolo26n.pt") #use to test with cars
 
 #create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
@@ -51,9 +58,11 @@ last_seen = {} #store the last seen frame of each object (key = track_id, value 
 last_position = {} #store the last position of each object (key = track_id, value = (x, y) coordinates)
 speed_history = {} #store the speed history of each object (key = track_id, value = recent speed measurements)
 kalman_filters = {} #store the Kalman filter for each object (key = track_id, value = filter for that object)
+predictions = {} #store the predictions for each object (key = track_id, value = dictionary of predictions for that object - key = prediction_horizon, value = (x, y) coordinates))
 
 current_frame = 0
 max_missing_frames = 30 #max frames an object can be missing before it is considered lost
+prediction_horizons = [0.5, 1.0, 2.0] #seconds into the future to predict the position of the object
 
 #run while loop to read frames from the video (frame by frame)
 while cap.isOpened():
@@ -96,6 +105,7 @@ while cap.isOpened():
                     current_y,
                     dt
                 )
+                predictions[track_id] = {} #initialize the predictions for this object
 
             kf = kalman_filters[track_id] #get the Kalman filter for this object
             prediction = kf.predict() #predict where the object is now
@@ -109,6 +119,23 @@ while cap.isOpened():
 
             filtered_vx = float(corrected[2][0])
             filtered_vy = float(corrected[3][0])
+
+            predictions[track_id] = {} #reset the predictions for this object - every frame we want to recalculate the predictions based on the new filtered position and velocity
+
+            #predict the future position of the object in this framefor each prediction horizon
+            for horizon in prediction_horizons:
+                predicted_x, predicted_y = predict_future_position(
+                    filtered_x,
+                    filtered_y,
+                    filtered_vx,
+                    filtered_vy,
+                    horizon
+                )
+
+                predictions[track_id][horizon] = (
+                    predicted_x,
+                    predicted_y
+                )
 
             estimated_speed = np.sqrt(filtered_vx**2 + filtered_vy**2) #calculate the estimated speed from the filtered velocity components
 
