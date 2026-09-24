@@ -39,11 +39,11 @@ def predict_future_position(x, y, vx, vy, time_ahead):
 
     return int(future_x), int(future_y)
 
-#model = yolo("models/drone-yolo26m.pt") #drone model
-model = yolo("models/yolo26n.pt") #use to test with cars
+model = yolo("models/drone-yolo26m.pt") #drone model
+#model = yolo("models/yolo26n.pt") #use to test with cars
 
 #create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
-cap = cv.VideoCapture("videos/testroad.mp4") 
+cap = cv.VideoCapture("videos/test.mp4") 
 
 if not cap.isOpened():
     print("Error: Could not open video.")
@@ -120,7 +120,7 @@ while cap.isOpened():
             filtered_vx = float(corrected[2][0])
             filtered_vy = float(corrected[3][0])
 
-            predictions[track_id] = {} #reset the predictions for this object - every frame we want to recalculate the predictions based on the new filtered position and velocity
+            predictions[track_id] = {} #reset the predictions for this object - every frame we want to recalculate the predictions based on the new filtered position and velocity  n 
 
             #predict the future position of the object in this framefor each prediction horizon
             for horizon in prediction_horizons:
@@ -180,6 +180,7 @@ while cap.isOpened():
                         "smoothed_speed_px_per_sec": smoothed_speed,
                         "filtered_x": filtered_x,
                         "filtered_y": filtered_y,
+                        "predictions": predictions[track_id]
                     }
 
                     #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
@@ -205,46 +206,121 @@ while cap.isOpened():
         last_position.pop(track_id, None)
         speed_history.pop(track_id, None)
         kalman_filters.pop(track_id, None)
+        predictions.pop(track_id, None)
 
     annotated_frame = result.plot()
-
-    #visualization area
-    for track_id, data in telemetry.items():
-        if "filtered_x" in data:
-            #show where the current velocity would carry the object after x seconds
-            velocity_scale = 0.5
-
-            #draw an arrow representing the velocity vector of the object
-            end_x = int(data["filtered_x"] + data["filtered_vx_px_per_sec"] * velocity_scale)
-            end_y = int(data["filtered_y"] + data["filtered_vy_px_per_sec"] * velocity_scale)
-
-            cv.arrowedLine(
-                annotated_frame,
-                (data["filtered_x"], data["filtered_y"]),
-                (end_x, end_y),
-                (0, 255, 0),
-                3
+    
+    
+    #draw historical trajectories
+    for track_id, points in track_history.items():
+        if len(points) > 1:
+            points_array = np.array(
+                points,
+                dtype=np.int32
             )
-
-            #draw a circle at the filtered position of the object
-            cv.circle(
-                annotated_frame,
-                (data["filtered_x"], data["filtered_y"]),
-                radius = 9,
-                color = (0, 0, 255), #OpenCV uses BGR not RBG
-                thickness = -1 #filled circle
-            )
-
-    for track_id, points in track_history.items(): #.items() lets you access key, value
-        if len(points) > 1: #only draw the trajectory if there are at least 2 points
-            points_array= np.array(points, dtype = np.int32) #convert the list of points to a numpy array
-            cv.polylines( #draw the trajectory of the object on the frame
+    
+            cv.polylines(
                 annotated_frame,
                 [points_array],
-                isClosed = False,
-                color = (255, 0, 0), #OpenCV uses BGR not RBG
-                thickness = 5
+                isClosed=False,
+                color=(255, 0, 0),
+                thickness=5
             )
+    
+    #draw current filtered state and future predictions
+    for track_id, data in telemetry.items():
+        #skip tracks that do not have a filtered state yet
+        if "filtered_x" not in data:
+            continue
+        
+        #draw current velocity vector
+        velocity_scale = 0.5
+    
+        end_x = int(
+            data["filtered_x"]
+            + data["filtered_vx_px_per_sec"] * velocity_scale
+        )
+    
+        end_y = int(
+            data["filtered_y"]
+            + data["filtered_vy_px_per_sec"] * velocity_scale
+        )
+    
+        cv.arrowedLine(
+            annotated_frame,
+            (
+                data["filtered_x"],
+                data["filtered_y"]
+            ),
+            (end_x, end_y),
+            (0, 255, 0),
+            3
+        )
+    
+        #draw current filtered position
+        cv.circle(
+            annotated_frame,
+            (
+                data["filtered_x"],
+                data["filtered_y"]
+            ),
+            radius=9,
+            color=(0, 0, 255),
+            thickness=-1
+        )
+    
+        #skip future prediction drawing if predictions are unavailable
+        if "predictions" not in data:
+            continue
+        
+        #start future trajectory at current filtered position
+        prediction_points = [
+            (
+                data["filtered_x"],
+                data["filtered_y"]
+            )
+        ]
+    
+        #add each future prediction
+        for horizon in prediction_horizons:
+            predicted_x, predicted_y = data["predictions"][horizon]
+            prediction_points.append(
+                (predicted_x, predicted_y)
+            )
+    
+            #draw predicted position
+            cv.circle(
+                annotated_frame,
+                (predicted_x, predicted_y),
+                radius=5,
+                color=(0, 255, 255),
+                thickness=-1
+            )
+            #label prediction time
+            cv.putText(
+                annotated_frame,
+                f"+{horizon}s",
+                (predicted_x + 5, predicted_y - 5),
+                cv.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1
+            )
+    
+        #convert prediction points to NumPy
+        prediction_array = np.array(
+            prediction_points,
+            dtype=np.int32
+        )
+    
+        #draw predicted trajectory
+        cv.polylines(
+            annotated_frame,
+            [prediction_array],
+            isClosed=False,
+            color=(0, 255, 255),
+            thickness=2
+        )
 
     display_frame = cv.resize(annotated_frame, (1280, 720))
     cv.imshow("UAV Tracker", display_frame) #display the frame in a window
