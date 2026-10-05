@@ -39,11 +39,43 @@ def predict_future_position(x, y, vx, vy, time_ahead):
 
     return int(future_x), int(future_y)
 
-model = yolo("models/drone-yolo26m.pt") #drone model
-#model = yolo("models/yolo26n.pt") #use to test with cars
+#evaluate the prediction error for a given track_id and current position, and store the results
+def evaluate_prediction(
+        track_id,
+        current_frame,
+        current_x,
+        current_y,
+        prediction_history,
+        prediction_results
+):
+    remaining_predictions = []
+
+    for prediction in prediction_history[track_id]:
+        if current_frame >= prediction["target_frame"]:
+            error_x = (
+                prediction["predicted_x"] - current_x
+            )
+            error_y = (
+                prediction["predicted_y"] - current_y
+            )
+            
+            error = np.sqrt(error_x**2 + error_y**2)
+
+            prediction_results[track_id].append({
+                "horizon": prediction["horizon"],
+                "error_px": error
+            })
+        else:
+            remaining_predictions.append(prediction)
+
+    #update the prediction history for this track_id with only the remaining predictions
+    prediction_history[track_id] = remaining_predictions
+
+#model = yolo("models/drone-yolo26m.pt") #drone model
+model = yolo("models/yolo26n.pt") #use to test with cars
 
 #create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
-cap = cv.VideoCapture("videos/test.mp4") 
+cap = cv.VideoCapture("videos/testroad.mp4") 
 
 if not cap.isOpened():
     print("Error: Could not open video.")
@@ -59,6 +91,8 @@ last_position = {} #store the last position of each object (key = track_id, valu
 speed_history = {} #store the speed history of each object (key = track_id, value = recent speed measurements)
 kalman_filters = {} #store the Kalman filter for each object (key = track_id, value = filter for that object)
 predictions = {} #store the predictions for each object (key = track_id, value = dictionary of predictions for that object - key = prediction_horizon, value = (x, y) coordinates))
+prediction_history = {} #store historical predictions
+prediction_results = {} #store the prediction results for each object (key = track_id, value = dictionary of prediction results for that object - key = prediction_horizon, value = (x, y) coordinates))
 
 current_frame = 0
 max_missing_frames = 30 #max frames an object can be missing before it is considered lost
@@ -106,6 +140,17 @@ while cap.isOpened():
                     dt
                 )
                 predictions[track_id] = {} #initialize the predictions for this object
+                prediction_results[track_id] = [] #initialize the prediction results for this object
+                prediction_history[track_id] = [] #initialize the prediction history for this object
+
+            evaluate_prediction(
+                track_id,
+                current_frame,
+                current_x,
+                current_y,
+                prediction_history,
+                prediction_results
+            )
 
             kf = kalman_filters[track_id] #get the Kalman filter for this object
             prediction = kf.predict() #predict where the object is now
@@ -136,6 +181,16 @@ while cap.isOpened():
                     predicted_x,
                     predicted_y
                 )
+
+                target_frame = current_frame + int(round(horizon * fps))
+
+                prediction_history[track_id].append({
+                    "created_frame": current_frame,
+                    "horizon": horizon,
+                    "target_frame": target_frame,
+                    "predicted_x": predicted_x,
+                    "predicted_y": predicted_y
+                })
 
             estimated_speed = np.sqrt(filtered_vx**2 + filtered_vy**2) #calculate the estimated speed from the filtered velocity components
 
@@ -178,8 +233,6 @@ while cap.isOpened():
                         "time_difference_sec": time_difference,
                         "speed_px_per_sec": speed_px_per_sec,
                         "smoothed_speed_px_per_sec": smoothed_speed,
-                        "filtered_x": filtered_x,
-                        "filtered_y": filtered_y,
                         "predictions": predictions[track_id]
                     }
 
@@ -207,9 +260,9 @@ while cap.isOpened():
         speed_history.pop(track_id, None)
         kalman_filters.pop(track_id, None)
         predictions.pop(track_id, None)
+        prediction_history.pop(track_id, None)
 
     annotated_frame = result.plot()
-    
     
     #draw historical trajectories
     for track_id, points in track_history.items():
