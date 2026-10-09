@@ -5,24 +5,27 @@ from ultralytics import YOLO as yolo
 def create_kalman_filter(x, y, dt):
     kf = cv.KalmanFilter(4, 2)
 
-    #define the state transition matrix (A) and measurement matrix (H)
+    # The state is [x, y, vx, vy], where position is measured in pixels and
+    # velocity is measured in pixels per second.
     kf.transitionMatrix = np.array([
-        [1, 0, dt, 0], #[x, y, vx, vy]
+        [1, 0, dt, 0],
         [0, 1, 0, dt],
         [0, 0, 1, 0],
         [0, 0, 0, 1]
     ], dtype=np.float32)
 
-    #define the measurement matrix (H)
+    # The detector provides position only; velocity is estimated by the filter.
     kf.measurementMatrix = np.array([
         [1, 0, 0, 0],
         [0, 1, 0, 0]
     ], dtype=np.float32)
 
-    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03 #process noise covariance: How much do I distrust my assumption that the object moves at constant velocity?
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0 #measurement noise covariance: How much do I distrust my assumption that the object moves at constant velocity?
+    # Lower process noise favors smooth, constant-velocity motion.
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+    # Measurement noise controls how strongly noisy detector positions are trusted.
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
 
-    #initialize the state vector (x, y, dx, dy) with the initial position and zero velocity
+    # Start at the first detected position with no initial velocity estimate.
     kf.statePost = np.array([
         [x],
         [y],
@@ -32,14 +35,14 @@ def create_kalman_filter(x, y, dt):
 
     return kf
 
-#predict the future position of an object given its current position, velocity, and time ahead
+# Predict a future pixel position from the filtered position and velocity.
 def predict_future_position(x, y, vx, vy, time_ahead):
     future_x = x + vx * time_ahead
     future_y = y + vy * time_ahead
 
     return int(future_x), int(future_y)
 
-#evaluate the prediction error for a given track_id and current position, and store the results
+# Compare predictions that have reached their target frame with the observed position.
 def evaluate_prediction(
         track_id,
         current_frame,
@@ -68,39 +71,45 @@ def evaluate_prediction(
         else:
             remaining_predictions.append(prediction)
 
-    #update the prediction history for this track_id with only the remaining predictions
+def calculate_prediction_metrics(prediction_results):
+    horizon_errors = {}
+
+    # TODO: Aggregate completed errors by prediction horizon before using this helper.
     prediction_history[track_id] = remaining_predictions
 
-#model = yolo("models/drone-yolo26m.pt") #drone model
-model = yolo("models/yolo26n.pt") #use to test with cars
+# Select the model used for this run. The bundled nano model is configured for
+# testing with cars; replace it with the drone model for UAV detection.
+# model = yolo("models/drone-yolo26m.pt")
+model = yolo("models/yolo26n.pt")
 
-#create a VideoCapture object (can access files OR camera (use 0 for camera, 1 for external camera, etc.))
+# Open the input video. A camera index such as 0 can be used instead of a file path.
 cap = cv.VideoCapture("videos/testroad.mp4") 
 
 if not cap.isOpened():
     print("Error: Could not open video.")
     exit()
 
-fps = cap.get(cv.CAP_PROP_FPS) #get the frames per second of the video
-dt = 1 / fps #calculate the time difference between frames. delta time
+fps = cap.get(cv.CAP_PROP_FPS)
+dt = 1 / fps  # Time between frames, used by the motion model.
 
-track_history = {} #store the track history of each object (key = track_id, value = list of (x, y) coordinates)
-telemetry = {} #store the telemetry data of each object
-last_seen = {} #store the last seen frame of each object (key = track_id, value = last seen frame)
-last_position = {} #store the last position of each object (key = track_id, value = (x, y) coordinates)
-speed_history = {} #store the speed history of each object (key = track_id, value = recent speed measurements)
-kalman_filters = {} #store the Kalman filter for each object (key = track_id, value = filter for that object)
-predictions = {} #store the predictions for each object (key = track_id, value = dictionary of predictions for that object - key = prediction_horizon, value = (x, y) coordinates))
-prediction_history = {} #store historical predictions
-prediction_results = {} #store the prediction results for each object (key = track_id, value = dictionary of prediction results for that object - key = prediction_horizon, value = (x, y) coordinates))
+# Per-track state. Every dictionary is keyed by the detector's persistent track ID.
+track_history = {}       # Recent observed center points, used to draw trajectories.
+telemetry = {}           # Latest motion measurements exposed for each track.
+last_seen = {}           # Frame number in which each track was most recently detected.
+last_position = {}       # Most recent raw center point and frame number.
+speed_history = {}       # Recent raw speed samples used for smoothing.
+kalman_filters = {}      # Kalman filter that estimates position and velocity.
+predictions = {}         # Latest future positions, keyed by prediction horizon in seconds.
+prediction_history = {}  # Predictions waiting to be evaluated at their target frame.
+prediction_results = {}  # Position error recorded for completed predictions.
 
 current_frame = 0
-max_missing_frames = 30 #max frames an object can be missing before it is considered lost
-prediction_horizons = [0.5, 1.0, 2.0] #seconds into the future to predict the position of the object
+max_missing_frames = 30  # Remove a track after this many consecutive missing frames.
+prediction_horizons = [0.5, 1.0, 2.0]  # Future prediction horizons, in seconds.
 
-#run while loop to read frames from the video (frame by frame)
+# Process the input one frame at a time until the stream ends or the user quits.
 while cap.isOpened():
-    success, frame = cap.read() #read a frame from the video
+    success, frame = cap.read()
     
     if not success:
         print("Could not read frame (stream ended). Exiting...")
@@ -108,7 +117,8 @@ while cap.isOpened():
 
     current_frame += 1
 
-    result = model.track( #run the model on the frame and get the results (detections). track too
+    # Detect objects and update ByteTrack's persistent IDs for this frame.
+    result = model.track(
         frame,
         persist = True,
         tracker = "bytetrack.yaml",
@@ -118,30 +128,30 @@ while cap.isOpened():
         device = 0,
         quantize = 16)[0] 
 
-    #work through every tracked object in the curr frame
+    # Update state for each object that was detected in the current frame.
     if result.boxes.id is not None:
-        track_ids = result.boxes.id.int().cpu().tolist() #get the track IDs/bounding boxes of the detected objects
-        boxes = result.boxes.xywh.cpu().tolist() #use xywh to get the center
+        track_ids = result.boxes.id.int().cpu().tolist()
+        boxes = result.boxes.xywh.cpu().tolist()  # [center_x, center_y, width, height]
 
-        #update the track history and telemetry data for each detected object
+        # Initialize all per-track containers the first time an ID appears.
         for box, track_id in zip(boxes, track_ids):
-            x, y, width, height = box #unpack the bounding box coordinates (x, y, width, height)
+            x, y, width, height = box
             current_x = int(x)
             current_y = int(y)
-            last_seen[track_id] = current_frame #update the last seen frame for each object in the curr frame
+            last_seen[track_id] = current_frame
 
             if track_id not in track_history:
-                track_history[track_id] = [] #initialize the track history for this object
-                telemetry[track_id] = {} #initialize the telemetry data for this object
-                speed_history[track_id] = [] #initialize the speed history for this object
-                kalman_filters[track_id] = create_kalman_filter( #initialize the Kalman filter for this object
+                track_history[track_id] = []
+                telemetry[track_id] = {}
+                speed_history[track_id] = []
+                kalman_filters[track_id] = create_kalman_filter(
                     current_x,
                     current_y,
                     dt
                 )
-                predictions[track_id] = {} #initialize the predictions for this object
-                prediction_results[track_id] = [] #initialize the prediction results for this object
-                prediction_history[track_id] = [] #initialize the prediction history for this object
+                predictions[track_id] = {}
+                prediction_results[track_id] = []
+                prediction_history[track_id] = []
 
             evaluate_prediction(
                 track_id,
@@ -152,22 +162,23 @@ while cap.isOpened():
                 prediction_results
             )
 
-            kf = kalman_filters[track_id] #get the Kalman filter for this object
-            prediction = kf.predict() #predict where the object is now
+            kf = kalman_filters[track_id]
+            prediction = kf.predict()  # Estimate the current state before applying the new measurement.
 
-            measurement = np.array([[np.float32(current_x)], [np.float32(current_y)]]) #create a measurement vector from the current position
-            corrected = kf.correct(measurement) #correct the prediction with the measurement
+            measurement = np.array([[np.float32(current_x)], [np.float32(current_y)]])
+            corrected = kf.correct(measurement)
 
-            #store the filtered position (after Kalman filter correction) for this object
+            # Read the smoothed position and velocity after the measurement update.
             filtered_x = int(corrected[0][0])
             filtered_y = int(corrected[1][0])
 
             filtered_vx = float(corrected[2][0])
             filtered_vy = float(corrected[3][0])
 
-            predictions[track_id] = {} #reset the predictions for this object - every frame we want to recalculate the predictions based on the new filtered position and velocity  n 
+            # Rebuild predictions every frame from the latest filtered state.
+            predictions[track_id] = {}
 
-            #predict the future position of the object in this framefor each prediction horizon
+            # Generate a prediction and evaluation record for each configured horizon.
             for horizon in prediction_horizons:
                 predicted_x, predicted_y = predict_future_position(
                     filtered_x,
@@ -192,11 +203,11 @@ while cap.isOpened():
                     "predicted_y": predicted_y
                 })
 
-            estimated_speed = np.sqrt(filtered_vx**2 + filtered_vy**2) #calculate the estimated speed from the filtered velocity components
+            estimated_speed = np.sqrt(filtered_vx**2 + filtered_vy**2)
 
             track_history[track_id].append((current_x, current_y))
 
-            #calculate the distance moved by the object since the last frame
+            # Calculate motion relative to the previous observation of this track.
             if track_id in last_position: 
                 previous_x, previous_y, previous_frame = last_position[track_id]
 
@@ -205,7 +216,7 @@ while cap.isOpened():
 
                 distance = np.sqrt(dx**2 + dy**2)
 
-                frame_difference = current_frame - previous_frame #used so program knows object was unseen for more than 1 frame
+                frame_difference = current_frame - previous_frame
 
                 if frame_difference > 0:
                     time_difference = frame_difference / fps
@@ -213,11 +224,11 @@ while cap.isOpened():
                     speed_history[track_id].append(speed_px_per_sec)
 
                     if len(speed_history[track_id]) > 5:
-                        speed_history[track_id].pop(0) #keep only the last 5 speed measurements
+                        speed_history[track_id].pop(0)
 
-                    smoothed_speed = np.mean(speed_history[track_id]) #calculate the average speed over the last 5 measurements
+                    smoothed_speed = np.mean(speed_history[track_id])
 
-                    #store the telemetry data for this object (updates every frame)
+                    # Store raw, filtered, and predicted motion data for downstream use.
                     telemetry[track_id] = {
                         "x": current_x,
                         "y": current_y,
@@ -236,23 +247,20 @@ while cap.isOpened():
                         "predictions": predictions[track_id]
                     }
 
-                    #print(f"Track ID: {track_id}, Telemetry: {telemetry[track_id]}")
-            
-            last_position[track_id] = (current_x, current_y, current_frame) #update the last position of this object
+            last_position[track_id] = (current_x, current_y, current_frame)
                 
             if len(track_history[track_id]) > 30:
                 track_history[track_id].pop(0)
 
-    #check for stale tracks to remove tracking
+    # Remove tracks that have not been observed recently.
     stale_tracks = []
 
     for track_id, last_frame in last_seen.items():
         if current_frame - last_frame > max_missing_frames:
             stale_tracks.append(track_id)
 
-    #pop the stale tracks from the dictionaries
+    # Keep all per-track dictionaries synchronized when a track expires.
     for track_id in stale_tracks:
-        #print(f"Removing stale track: {track_id}")
         track_history.pop(track_id, None)
         telemetry.pop(track_id, None)
         last_seen.pop(track_id, None)
@@ -264,7 +272,7 @@ while cap.isOpened():
 
     annotated_frame = result.plot()
     
-    #draw historical trajectories
+    # Draw the recent observed trajectory for each active track.
     for track_id, points in track_history.items():
         if len(points) > 1:
             points_array = np.array(
@@ -280,13 +288,13 @@ while cap.isOpened():
                 thickness=5
             )
     
-    #draw current filtered state and future predictions
+    # Draw each track's filtered state, velocity vector, and future predictions.
     for track_id, data in telemetry.items():
-        #skip tracks that do not have a filtered state yet
+        # Telemetry is populated only after a previous observation exists.
         if "filtered_x" not in data:
             continue
         
-        #draw current velocity vector
+        # Scale the velocity vector so it remains visible at video resolution.
         velocity_scale = 0.5
     
         end_x = int(
@@ -310,7 +318,7 @@ while cap.isOpened():
             3
         )
     
-        #draw current filtered position
+        # Mark the current filtered position.
         cv.circle(
             annotated_frame,
             (
@@ -322,11 +330,11 @@ while cap.isOpened():
             thickness=-1
         )
     
-        #skip future prediction drawing if predictions are unavailable
+        # Some tracks may not yet have telemetry with prediction data.
         if "predictions" not in data:
             continue
         
-        #start future trajectory at current filtered position
+        # Start the predicted path at the current filtered position.
         prediction_points = [
             (
                 data["filtered_x"],
@@ -334,14 +342,14 @@ while cap.isOpened():
             )
         ]
     
-        #add each future prediction
+        # Add and label each configured future position.
         for horizon in prediction_horizons:
             predicted_x, predicted_y = data["predictions"][horizon]
             prediction_points.append(
                 (predicted_x, predicted_y)
             )
     
-            #draw predicted position
+            # Mark the predicted position.
             cv.circle(
                 annotated_frame,
                 (predicted_x, predicted_y),
@@ -349,7 +357,7 @@ while cap.isOpened():
                 color=(0, 255, 255),
                 thickness=-1
             )
-            #label prediction time
+            # Label the prediction horizon in seconds.
             cv.putText(
                 annotated_frame,
                 f"+{horizon}s",
@@ -360,13 +368,13 @@ while cap.isOpened():
                 1
             )
     
-        #convert prediction points to NumPy
+        # Convert the points before passing them to OpenCV.
         prediction_array = np.array(
             prediction_points,
             dtype=np.int32
         )
     
-        #draw predicted trajectory
+        # Draw the projected trajectory.
         cv.polylines(
             annotated_frame,
             [prediction_array],
@@ -376,9 +384,9 @@ while cap.isOpened():
         )
 
     display_frame = cv.resize(annotated_frame, (1280, 720))
-    cv.imshow("UAV Tracker", display_frame) #display the frame in a window
+    cv.imshow("UAV Tracker", display_frame)
 
-    if cv.waitKey(1) & 0xFF == ord('q'): #play the video (1ms frame switch) until 'q' is pressed
+    if cv.waitKey(1) & 0xFF == ord('q'):  # Press Q to stop playback.
         break       
 
 cap.release()
